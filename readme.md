@@ -23,10 +23,10 @@
 ### 示例服务器
 
 ```
-./anytls-server -l 0.0.0.0:8443 -p 密码
+./anytls-server -l 0.0.0.0:8443 -p /path/to/passwords.json
 ```
 
-`0.0.0.0:8443` 为服务器监听的地址和端口。
+`0.0.0.0:8443` 为服务器监听的地址和端口。`-p` 参数为密码 JSON 文件路径，格式为 `{"passwords":["password1","password2"]}`。进程收到 `SIGHUP` 后会从同一路径重新加载该文件。
 
 ### 示例客户端
 

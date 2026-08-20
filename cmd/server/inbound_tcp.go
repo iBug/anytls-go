@@ -38,7 +38,21 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	c = bufio.NewCachedConn(c, b)
 
 	by, err := b.ReadBytes(32)
-	if err != nil || !bytes.Equal(by, passwordSha256) {
+	if err != nil {
+		b.Resize(0, n)
+		fallback(ctx, c)
+		return
+	}
+	passwordMatched := false
+	if hashes, ok := passwordHashes.Load().([][32]byte); ok {
+		for _, hash := range hashes {
+			if bytes.Equal(by, hash[:]) {
+				passwordMatched = true
+				break
+			}
+		}
+	}
+	if !passwordMatched {
 		b.Resize(0, n)
 		fallback(ctx, c)
 		return
