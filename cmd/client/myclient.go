@@ -14,13 +14,15 @@ import (
 )
 
 type myClient struct {
-	dialOut       util.DialOutFunc
-	sessionClient *session.Client
+	dialOut        util.DialOutFunc
+	passwordSha256 [32]byte
+	sessionClient  *session.Client
 }
 
-func NewMyClient(ctx context.Context, dialOut util.DialOutFunc, minIdleSession int, disableReuse bool) *myClient {
+func NewMyClient(ctx context.Context, dialOut util.DialOutFunc, passwordSha256 [32]byte, minIdleSession int, disableReuse bool) *myClient {
 	s := &myClient{
-		dialOut: dialOut,
+		dialOut:        dialOut,
+		passwordSha256: passwordSha256,
 	}
 	s.sessionClient = session.NewClient(ctx, s.createOutboundConnection, &padding.DefaultPaddingFactory, time.Second*30, time.Second*30, minIdleSession, disableReuse)
 	return s
@@ -48,7 +50,7 @@ func (c *myClient) createOutboundConnection(ctx context.Context) (net.Conn, erro
 	b := buf.NewPacket()
 	defer b.Release()
 
-	b.Write(passwordSha256)
+	b.Write(c.passwordSha256[:])
 	var paddingLen int
 	if pad := padding.DefaultPaddingFactory.Load().GenerateRecordPayloadSizes(0); len(pad) > 0 {
 		paddingLen = pad[0]

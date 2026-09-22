@@ -1,0 +1,4 @@
+clients:
+  - listen: 127.0.0.1:1080
+    server: 服务器ip:端口
+    password: 密码

@@ -3,7 +3,6 @@ package main
 import (
 	"anytls/proxy/padding"
 	"anytls/proxy/session"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -38,11 +37,29 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	c = bufio.NewCachedConn(c, b)
 
 	by, err := b.ReadBytes(32)
-	if err != nil || !bytes.Equal(by, passwordSha256) {
+	if err != nil {
 		b.Resize(0, n)
 		fallback(ctx, c)
 		return
 	}
+	var byHash [32]byte
+	copy(byHash[:], by)
+	var (
+		matchedUser string
+		matched     bool
+	)
+	if hashes, ok := userByPasswordHash.Load().(map[[32]byte]string); ok {
+		matchedUser, matched = hashes[byHash]
+	}
+	if !matched {
+		b.Resize(0, n)
+		fallback(ctx, c)
+		return
+	}
+	remoteAddr := c.RemoteAddr().String()
+	activeConnectionUser.Store(remoteAddr, matchedUser)
+	defer activeConnectionUser.Delete(remoteAddr)
+	logrus.Debugln("authenticated user:", matchedUser, "remote:", remoteAddr)
 	by, err = b.ReadBytes(2)
 	if err != nil {
 		b.Resize(0, n)

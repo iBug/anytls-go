@@ -7,46 +7,82 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"flag"
+	"fmt"
+	"io"
 	"net"
-	"net/url"
 	"os"
 	"strings"
 
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
-var passwordSha256 []byte
+type config struct {
+	Clients []clientConfig `yaml:"clients"`
+}
+
+type clientConfig struct {
+	Listen   string `yaml:"listen"`
+	Server   string `yaml:"server"`
+	Password string `yaml:"password"`
+}
+
+type configuredListener struct {
+	config   clientConfig
+	listener net.Listener
+}
+
+func loadConfig(path string) (*config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var cfg config
+	decoder := yaml.NewDecoder(f)
+	decoder.KnownFields(true)
+	if err = decoder.Decode(&cfg); err != nil {
+		return nil, err
+	}
+
+	var extra any
+	if err = decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple YAML documents are not supported")
+		}
+		return nil, err
+	}
+
+	if len(cfg.Clients) == 0 {
+		return nil, fmt.Errorf("clients must contain at least one item")
+	}
+	for i := range cfg.Clients {
+		client := &cfg.Clients[i]
+		client.Listen = strings.TrimSpace(client.Listen)
+		client.Server = strings.TrimSpace(client.Server)
+		if _, _, err = net.SplitHostPort(client.Listen); err != nil {
+			return nil, fmt.Errorf("clients[%d].listen %q: %w", i, client.Listen, err)
+		}
+		if _, _, err = net.SplitHostPort(client.Server); err != nil {
+			return nil, fmt.Errorf("clients[%d].server %q: %w", i, client.Server, err)
+		}
+		if client.Password == "" {
+			return nil, fmt.Errorf("clients[%d].password must not be empty", i)
+		}
+	}
+	return &cfg, nil
+}
 
 func main() {
-	listen := flag.String("l", "127.0.0.1:1080", "socks5 listen port")
-	serverAddr := flag.String("s", "", "Server address or anytls:// link")
+	configPath := flag.String("c", "", "path to client YAML config")
 	sni := flag.String("sni", "", "Server Name Indication")
-	password := flag.String("p", "", "Password")
 	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
 	disableReuse := flag.Bool("dr", false, "Disable client session reuse")
 	flag.Parse()
 
-	if serverURL, err := url.Parse(*serverAddr); err == nil {
-		if serverURL.Scheme == "anytls" {
-			*serverAddr = serverURL.Host
-			if serverURL.User != nil {
-				*password = serverURL.User.String()
-			}
-			query := serverURL.Query()
-			*sni = query.Get("sni")
-		}
-	}
-
-	if *serverAddr == "" {
-		logrus.Fatalln("please set -s server adreess")
-	}
-
-	if *password == "" {
-		logrus.Fatalln("please set -p password")
-	}
-
-	if _, _, err := net.SplitHostPort(*serverAddr); err != nil {
-		logrus.Fatalln("error server address:", *serverAddr, err)
+	if *configPath == "" {
+		logrus.Fatalln("please set -c config path")
 	}
 
 	logLevel, err := logrus.ParseLevel(os.Getenv("LOG_LEVEL"))
@@ -55,49 +91,73 @@ func main() {
 	}
 	logrus.SetLevel(logLevel)
 
-	var sum = sha256.Sum256([]byte(*password))
-	passwordSha256 = sum[:]
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		logrus.Fatalln("load config:", err)
+	}
 
 	logrus.Infoln("[Client]", util.ProgramVersionName)
-	logrus.Infoln("[Client] socks5/http", *listen, "=>", *serverAddr)
 
-	listener, err := net.Listen("tcp", *listen)
-	if err != nil {
-		logrus.Fatalln("listen socks5 tcp:", err)
-	}
-
-	// You can only use `InsecureSkipVerify` by default in the sample client; it is not recommended for use in production code.
-	tlsConfig := &tls.Config{
-		ServerName:         *sni,
-		InsecureSkipVerify: true,
-	}
-	if tlsConfig.ServerName == "" {
-		// disable the SNI
-		tlsConfig.ServerName = "127.0.0.1"
-	}
-
+	var keyLogWriter io.Writer
 	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-		if err == nil {
-			tlsConfig.KeyLogWriter = f
+		f, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		if openErr != nil {
+			logrus.Warnln("open TLS key log:", openErr)
+		} else {
+			defer f.Close()
+			keyLogWriter = f
 		}
+	}
+
+	listeners := make([]configuredListener, 0, len(cfg.Clients))
+	for _, clientCfg := range cfg.Clients {
+		listener, listenErr := net.Listen("tcp", clientCfg.Listen)
+		if listenErr != nil {
+			for _, opened := range listeners {
+				_ = opened.listener.Close()
+			}
+			logrus.Fatalln("listen socks5/http tcp:", clientCfg.Listen, listenErr)
+		}
+		listeners = append(listeners, configuredListener{config: clientCfg, listener: listener})
 	}
 
 	ctx := context.Background()
+	errCh := make(chan error, len(listeners))
+	for _, configured := range listeners {
+		go serveClient(ctx, configured, *sni, keyLogWriter, *minIdleSession, *disableReuse, errCh)
+	}
+	logrus.Fatalln(<-errCh)
+}
+
+func serveClient(ctx context.Context, configured configuredListener, sni string, keyLogWriter io.Writer, minIdleSession int, disableReuse bool, errCh chan<- error) {
+	clientCfg := configured.config
+	// InsecureSkipVerify is acceptable only in this sample client; it is not recommended for production code.
+	tlsConfig := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		KeyLogWriter:       keyLogWriter,
+	}
+	if tlsConfig.ServerName == "" {
+		// Disable SNI.
+		tlsConfig.ServerName = "127.0.0.1"
+	}
+
+	passwordSha256 := sha256.Sum256([]byte(clientCfg.Password))
 	client := NewMyClient(ctx, func(ctx context.Context) (net.Conn, error) {
-		conn, err := proxy.SystemDialer.DialContext(ctx, "tcp", *serverAddr)
+		conn, err := proxy.SystemDialer.DialContext(ctx, "tcp", clientCfg.Server)
 		if err != nil {
 			return nil, err
 		}
-		conn = tls.Client(conn, tlsConfig)
-		return conn, nil
-	}, *minIdleSession, *disableReuse)
+		return tls.Client(conn, tlsConfig), nil
+	}, passwordSha256, minIdleSession, disableReuse)
 
+	logrus.Infoln("[Client] socks5/http", clientCfg.Listen, "=>", clientCfg.Server)
 	for {
-		c, err := listener.Accept()
+		c, err := configured.listener.Accept()
 		if err != nil {
-			logrus.Fatalln("accept:", err)
+			errCh <- fmt.Errorf("accept on %s: %w", clientCfg.Listen, err)
+			return
 		}
 		go handleTcpConnection(ctx, c, client)
 	}

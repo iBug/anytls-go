@@ -23,23 +23,24 @@
 ### 示例服务器
 
 ```
-./anytls-server -l 0.0.0.0:8443 -p 密码
+./anytls-server -l 0.0.0.0:8443 -p /path/to/users.json
 ```
 
-`0.0.0.0:8443` 为服务器监听的地址和端口。
+`0.0.0.0:8443` 为服务器监听的地址和端口。`-p` 参数为用户 JSON 文件路径，格式为 `{"users":{"user1":"password1","user2":"password2"}}`。进程收到 `SIGHUP` 后会从同一路径重新加载该文件，认证成功后会记录连接对应的用户名。
 
 ### 示例客户端
 
 ```
-./anytls-client -l 127.0.0.1:1080 -s 服务器ip:端口 -p 密码
+./anytls-client -c /path/to/config.yml
 ```
 
-`127.0.0.1:1080` 为本机 Socks5 代理监听地址，理论上支持 TCP 和 UDP(通过 udp over tcp 传输)。
-
-v0.0.12 版本起，示例客户端可直接使用 URI 格式:
+配置文件格式参见 [`examples/config.yml`](./examples/config.yml)。`clients` 列表中的每一项都会启动一个 Socks5/HTTP 代理监听器，理论上支持 TCP 和 UDP（通过 udp over tcp 传输）。
 
 ```
-./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port"
+clients:
+  - listen: 127.0.0.1:1080
+    server: 服务器ip:端口
+    password: 密码
 ```
 
 ## 第三方兼容软件
