@@ -13,6 +13,9 @@ clients:
   - listen: 127.0.0.1:1080
     server: example.com:443
     password: first
+    sni: first.example.com
+    min-idle: 8
+    disable-reuse: true
   - listen: "[::1]:1081"
     server: "[2001:db8::1]:8443"
     password: second
@@ -28,15 +31,22 @@ clients:
 	if cfg.Clients[1].Server != "[2001:db8::1]:8443" {
 		t.Fatalf("got second server %q", cfg.Clients[1].Server)
 	}
+	if cfg.Clients[0].SNI != "first.example.com" || cfg.Clients[0].minIdle() != 8 || !cfg.Clients[0].DisableReuse {
+		t.Fatalf("got first client settings %+v", cfg.Clients[0])
+	}
+	if cfg.Clients[1].SNI != "" || cfg.Clients[1].minIdle() != 5 || cfg.Clients[1].DisableReuse {
+		t.Fatalf("got second client defaults %+v", cfg.Clients[1])
+	}
 }
 
 func TestLoadConfigRejectsInvalidItems(t *testing.T) {
 	tests := map[string]string{
-		"no clients":     "clients: []\n",
-		"invalid listen": "clients:\n  - listen: '1080'\n    server: example.com:443\n    password: secret\n",
-		"invalid server": "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com\n    password: secret\n",
-		"empty password": "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com:443\n    password: ''\n",
-		"unknown field":  "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com:443\n    password: secret\n    typo: value\n",
+		"no clients":        "clients: []\n",
+		"invalid listen":    "clients:\n  - listen: '1080'\n    server: example.com:443\n    password: secret\n",
+		"invalid server":    "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com\n    password: secret\n",
+		"empty password":    "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com:443\n    password: ''\n",
+		"negative min idle": "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com:443\n    password: secret\n    min-idle: -1\n",
+		"unknown field":     "clients:\n  - listen: 127.0.0.1:1080\n    server: example.com:443\n    password: secret\n    typo: value\n",
 	}
 
 	for name, contents := range tests {

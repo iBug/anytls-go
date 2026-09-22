@@ -41,6 +41,9 @@ clients:
   - listen: 127.0.0.1:1080
     server: 服务器ip:端口
     password: 密码
+    sni: 服务器域名
+    min-idle: 5
+    disable-reuse: false
 ```
 
 ## 第三方兼容软件

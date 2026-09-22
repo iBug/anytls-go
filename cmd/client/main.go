@@ -22,9 +22,19 @@ type config struct {
 }
 
 type clientConfig struct {
-	Listen   string `yaml:"listen"`
-	Server   string `yaml:"server"`
-	Password string `yaml:"password"`
+	Listen       string `yaml:"listen"`
+	Server       string `yaml:"server"`
+	Password     string `yaml:"password"`
+	SNI          string `yaml:"sni"`
+	MinIdle      *int   `yaml:"min-idle"`
+	DisableReuse bool   `yaml:"disable-reuse"`
+}
+
+func (c clientConfig) minIdle() int {
+	if c.MinIdle == nil {
+		return 5
+	}
+	return *c.MinIdle
 }
 
 type configuredListener struct {
@@ -70,15 +80,15 @@ func loadConfig(path string) (*config, error) {
 		if client.Password == "" {
 			return nil, fmt.Errorf("clients[%d].password must not be empty", i)
 		}
+		if client.minIdle() < 0 {
+			return nil, fmt.Errorf("clients[%d].min-idle must not be negative", i)
+		}
 	}
 	return &cfg, nil
 }
 
 func main() {
 	configPath := flag.String("c", "", "path to client YAML config")
-	sni := flag.String("sni", "", "Server Name Indication")
-	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
-	disableReuse := flag.Bool("dr", false, "Disable client session reuse")
 	flag.Parse()
 
 	if *configPath == "" {
@@ -125,16 +135,16 @@ func main() {
 	ctx := context.Background()
 	errCh := make(chan error, len(listeners))
 	for _, configured := range listeners {
-		go serveClient(ctx, configured, *sni, keyLogWriter, *minIdleSession, *disableReuse, errCh)
+		go serveClient(ctx, configured, keyLogWriter, errCh)
 	}
 	logrus.Fatalln(<-errCh)
 }
 
-func serveClient(ctx context.Context, configured configuredListener, sni string, keyLogWriter io.Writer, minIdleSession int, disableReuse bool, errCh chan<- error) {
+func serveClient(ctx context.Context, configured configuredListener, keyLogWriter io.Writer, errCh chan<- error) {
 	clientCfg := configured.config
 	// InsecureSkipVerify is acceptable only in this sample client; it is not recommended for production code.
 	tlsConfig := &tls.Config{
-		ServerName:         sni,
+		ServerName:         clientCfg.SNI,
 		InsecureSkipVerify: true,
 		KeyLogWriter:       keyLogWriter,
 	}
@@ -150,7 +160,7 @@ func serveClient(ctx context.Context, configured configuredListener, sni string,
 			return nil, err
 		}
 		return tls.Client(conn, tlsConfig), nil
-	}, passwordSha256, minIdleSession, disableReuse)
+	}, passwordSha256, clientCfg.minIdle(), clientCfg.DisableReuse)
 
 	logrus.Infoln("[Client] socks5/http", clientCfg.Listen, "=>", clientCfg.Server)
 	for {
