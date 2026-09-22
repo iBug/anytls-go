@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -65,6 +69,115 @@ func TestLoadConfigRejectsMultipleDocuments(t *testing.T) {
 	_, err := loadConfig(path)
 	if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
 		t.Fatalf("got error %v, want multiple-document error", err)
+	}
+}
+
+func TestReloadInvalidConfigLeavesListenersUntouched(t *testing.T) {
+	path := writeTestConfig(t, testClientConfig("127.0.0.1:0", "first.example:443"))
+	manager := newListenerManager(context.Background(), path, nil)
+	if err := manager.start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.active.retire() })
+
+	active := manager.active
+	address := active.listeners[0].listener.Addr().String()
+	if err := os.WriteFile(path, []byte("clients: []\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.reload(); err == nil {
+		t.Fatal("expected invalid reload to fail")
+	}
+	if manager.active != active {
+		t.Fatal("invalid reload replaced the active listener set")
+	}
+	assertDialSucceeds(t, address)
+}
+
+func TestReloadReplacesListeners(t *testing.T) {
+	oldAddress := freeTCPAddress(t)
+	newAddress := freeTCPAddress(t)
+	path := writeTestConfig(t, testClientConfig(oldAddress, "first.example:443"))
+	manager := newListenerManager(context.Background(), path, nil)
+	if err := manager.start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.active.retire() })
+
+	oldSet := manager.active
+	if err := os.WriteFile(path, []byte(testClientConfig(newAddress, "second.example:443")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if manager.active == oldSet {
+		t.Fatal("valid reload did not replace the active listener set")
+	}
+	if manager.config.Clients[0].Server != "second.example:443" {
+		t.Fatalf("got server %q after reload", manager.config.Clients[0].Server)
+	}
+	assertDialFails(t, oldAddress)
+	assertDialSucceeds(t, newAddress)
+}
+
+func TestReloadReopensUnchangedListenAddress(t *testing.T) {
+	address := freeTCPAddress(t)
+	path := writeTestConfig(t, testClientConfig(address, "first.example:443"))
+	manager := newListenerManager(context.Background(), path, nil)
+	if err := manager.start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.active.retire() })
+
+	oldSet := manager.active
+	if err := os.WriteFile(path, []byte(testClientConfig(address, "second.example:443")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if manager.active == oldSet {
+		t.Fatal("reload did not replace the listener set")
+	}
+	if manager.config.Clients[0].Server != "second.example:443" {
+		t.Fatalf("got server %q after reload", manager.config.Clients[0].Server)
+	}
+	assertDialSucceeds(t, address)
+}
+
+func testClientConfig(listen, server string) string {
+	return fmt.Sprintf("clients:\n  - listen: %s\n    server: %s\n    password: secret\n    min-idle: 0\n", listen, server)
+}
+
+func freeTCPAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func assertDialSucceeds(t *testing.T, address string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", address, err)
+	}
+	_ = conn.Close()
+}
+
+func assertDialFails(t *testing.T, address string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("dial to retired listener %s succeeded", address)
 	}
 }
 

@@ -36,6 +36,8 @@
 
 配置文件格式参见 [`examples/config.yml`](./examples/config.yml)。`clients` 列表中的每一项都会启动一个 Socks5/HTTP 代理监听器，理论上支持 TCP 和 UDP（通过 udp over tcp 传输）。
 
+修改配置文件后可向客户端进程发送 `SIGHUP` 重新加载。重新加载会替换全部监听器，并尽量保持已建立的连接；如果新配置校验失败，则保留现有监听器并输出警告。
+
 ```
 clients:
   - listen: 127.0.0.1:1080

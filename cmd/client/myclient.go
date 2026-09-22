@@ -41,6 +41,10 @@ func (c *myClient) CreateProxy(ctx context.Context, destination M.Socksaddr) (ne
 	return conn, nil
 }
 
+func (c *myClient) Close() error {
+	return c.sessionClient.Close()
+}
+
 func (c *myClient) createOutboundConnection(ctx context.Context) (net.Conn, error) {
 	conn, err := c.dialOut(ctx)
 	if err != nil {

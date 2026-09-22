@@ -6,12 +6,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -37,9 +41,27 @@ func (c clientConfig) minIdle() int {
 	return *c.MinIdle
 }
 
-type configuredListener struct {
+type clientListener struct {
 	config   clientConfig
 	listener net.Listener
+	client   *myClient
+
+	connections sync.WaitGroup
+	acceptDone  chan struct{}
+}
+
+type listenerSet struct {
+	listeners []*clientListener
+	errCh     chan error
+}
+
+type listenerManager struct {
+	ctx          context.Context
+	configPath   string
+	keyLogWriter io.Writer
+	config       *config
+	active       *listenerSet
+	errCh        chan error
 }
 
 func loadConfig(path string) (*config, error) {
@@ -101,11 +123,6 @@ func main() {
 	}
 	logrus.SetLevel(logLevel)
 
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		logrus.Fatalln("load config:", err)
-	}
-
 	logrus.Infoln("[Client]", util.ProgramVersionName)
 
 	var keyLogWriter io.Writer
@@ -120,28 +137,101 @@ func main() {
 		}
 	}
 
-	listeners := make([]configuredListener, 0, len(cfg.Clients))
-	for _, clientCfg := range cfg.Clients {
-		listener, listenErr := net.Listen("tcp", clientCfg.Listen)
-		if listenErr != nil {
-			for _, opened := range listeners {
-				_ = opened.listener.Close()
-			}
-			logrus.Fatalln("listen socks5/http tcp:", clientCfg.Listen, listenErr)
-		}
-		listeners = append(listeners, configuredListener{config: clientCfg, listener: listener})
+	ctx := context.Background()
+	manager := newListenerManager(ctx, *configPath, keyLogWriter)
+	if err = manager.start(); err != nil {
+		logrus.Fatalln("start listeners:", err)
 	}
 
-	ctx := context.Background()
-	errCh := make(chan error, len(listeners))
-	for _, configured := range listeners {
-		go serveClient(ctx, configured, keyLogWriter, errCh)
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, syscall.SIGHUP)
+	defer signal.Stop(reloadCh)
+
+	for {
+		select {
+		case <-reloadCh:
+			if err = manager.reload(); err != nil {
+				logrus.Warnln("reload config:", err)
+			} else {
+				logrus.Infoln("reloaded config:", *configPath)
+			}
+		case err = <-manager.errCh:
+			logrus.Fatalln(err)
+		}
 	}
-	logrus.Fatalln(<-errCh)
 }
 
-func serveClient(ctx context.Context, configured configuredListener, keyLogWriter io.Writer, errCh chan<- error) {
-	clientCfg := configured.config
+func newListenerManager(ctx context.Context, configPath string, keyLogWriter io.Writer) *listenerManager {
+	return &listenerManager{
+		ctx:          ctx,
+		configPath:   configPath,
+		keyLogWriter: keyLogWriter,
+		errCh:        make(chan error, 1),
+	}
+}
+
+func (m *listenerManager) start() error {
+	cfg, err := loadConfig(m.configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	listeners, err := openListenerSet(m.ctx, cfg, m.keyLogWriter, m.errCh)
+	if err != nil {
+		return err
+	}
+	m.config = cfg
+	m.active = listeners
+	return nil
+}
+
+func (m *listenerManager) reload() error {
+	cfg, err := loadConfig(m.configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	previousConfig := m.config
+	m.active.retire()
+	listeners, err := openListenerSet(m.ctx, cfg, m.keyLogWriter, m.errCh)
+	if err != nil {
+		restored, restoreErr := openListenerSet(m.ctx, previousConfig, m.keyLogWriter, m.errCh)
+		if restoreErr != nil {
+			m.active = nil
+			return fmt.Errorf("open new listeners: %w; restore previous listeners: %v", err, restoreErr)
+		}
+		m.active = restored
+		return fmt.Errorf("open new listeners: %w; restored previous listeners", err)
+	}
+
+	m.config = cfg
+	m.active = listeners
+	return nil
+}
+
+func openListenerSet(ctx context.Context, cfg *config, keyLogWriter io.Writer, errCh chan error) (*listenerSet, error) {
+	set := &listenerSet{errCh: errCh}
+	for _, clientCfg := range cfg.Clients {
+		listener, err := net.Listen("tcp", clientCfg.Listen)
+		if err != nil {
+			set.closeUnstarted()
+			return nil, fmt.Errorf("listen on %s: %w", clientCfg.Listen, err)
+		}
+		set.listeners = append(set.listeners, &clientListener{
+			config:     clientCfg,
+			listener:   listener,
+			acceptDone: make(chan struct{}),
+		})
+	}
+
+	for _, listener := range set.listeners {
+		listener.client = newConfiguredClient(ctx, listener.config, keyLogWriter)
+		go listener.serve(ctx, set.errCh)
+		logrus.Infoln("[Client] socks5/http", listener.config.Listen, "=>", listener.config.Server)
+	}
+	return set, nil
+}
+
+func newConfiguredClient(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) *myClient {
 	// InsecureSkipVerify is acceptable only in this sample client; it is not recommended for production code.
 	tlsConfig := &tls.Config{
 		ServerName:         clientCfg.SNI,
@@ -161,14 +251,45 @@ func serveClient(ctx context.Context, configured configuredListener, keyLogWrite
 		}
 		return tls.Client(conn, tlsConfig), nil
 	}, passwordSha256, clientCfg.minIdle(), clientCfg.DisableReuse)
+	return client
+}
 
-	logrus.Infoln("[Client] socks5/http", clientCfg.Listen, "=>", clientCfg.Server)
+func (l *clientListener) serve(ctx context.Context, errCh chan<- error) {
+	defer close(l.acceptDone)
 	for {
-		c, err := configured.listener.Accept()
+		c, err := l.listener.Accept()
 		if err != nil {
-			errCh <- fmt.Errorf("accept on %s: %w", clientCfg.Listen, err)
+			if !errors.Is(err, net.ErrClosed) {
+				select {
+				case errCh <- fmt.Errorf("accept on %s: %w", l.config.Listen, err):
+				default:
+				}
+			}
 			return
 		}
-		go handleTcpConnection(ctx, c, client)
+		l.connections.Add(1)
+		go func() {
+			defer l.connections.Done()
+			handleTcpConnection(ctx, c, l.client)
+		}()
+	}
+}
+
+func (s *listenerSet) retire() {
+	for _, listener := range s.listeners {
+		_ = listener.listener.Close()
+	}
+	for _, listener := range s.listeners {
+		go func() {
+			<-listener.acceptDone
+			listener.connections.Wait()
+			_ = listener.client.Close()
+		}()
+	}
+}
+
+func (s *listenerSet) closeUnstarted() {
+	for _, listener := range s.listeners {
+		_ = listener.listener.Close()
 	}
 }
