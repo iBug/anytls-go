@@ -1,3 +1,5 @@
+version: 2
+
 # This is an example .goreleaser.yml file with some sensible defaults.
 # Make sure to check the documentation at https://goreleaser.com
 project_name: anytls
@@ -38,8 +40,25 @@ builds:
       - -s -w
 archives:
   - id: anytls
-    builds:
+    ids:
       - anytls-client
       - anytls-server
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format: zip
+    formats:
+      - zip
+nfpms:
+  - id: anytls
+    package_name: anytls
+    ids:
+      - anytls-client
+      - anytls-server
+    formats:
+      - deb
+    maintainer: anytls maintainers
+    description: AnyTLS client and server
+    license: MIT
+    contents:
+      - src: examples/anytls-client.service
+        dst: /lib/systemd/system/anytls-client.service
+      - src: readme.md
+        dst: /usr/share/doc/anytls/readme.md

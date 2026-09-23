@@ -1,0 +1,14 @@
+[Unit]
+Description=AnyTLS Client
+After=network.target network-online.target
+ConditionPathExists=/etc/anytls-client.yml
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/anytls-client-ibug -c /etc/anytls-client.yml
+WorkingDirectory=/run/anytls
+RuntimeDirectory=anytls
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
