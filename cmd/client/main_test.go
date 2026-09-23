@@ -75,6 +75,10 @@ func TestListenUnix(t *testing.T) {
 	t.Cleanup(func() { _ = listener.Close() })
 
 	assert.Equal(t, "unix", listener.Addr().Network())
+	info, err := os.Stat(path)
+	if assert.NoError(t, err) {
+		assert.Equal(t, os.FileMode(0666), info.Mode().Perm())
+	}
 	conn, err := net.DialTimeout("unix", path, time.Second)
 	if assert.NoError(t, err) {
 		assert.NoError(t, conn.Close())

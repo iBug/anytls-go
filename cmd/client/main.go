@@ -294,7 +294,16 @@ func listen(address string) (net.Listener, error) {
 		return nil, fmt.Errorf("inspect Unix socket path: %w", err)
 	}
 
-	return net.Listen("unix", address)
+	listener, err := net.Listen("unix", address)
+	if err != nil {
+		return nil, err
+	}
+	if err = os.Chmod(address, 0666); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(address)
+		return nil, fmt.Errorf("set Unix socket permissions: %w", err)
+	}
+	return listener, nil
 }
 
 func newClientGeneration(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) *clientGeneration {
