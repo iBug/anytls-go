@@ -42,17 +42,22 @@ func (c clientConfig) minIdle() int {
 }
 
 type clientListener struct {
-	config   clientConfig
+	listen   string
 	listener net.Listener
-	client   *myClient
 
+	generationMu sync.Mutex
+	generation   *clientGeneration
+	acceptDone   chan struct{}
+}
+
+type clientGeneration struct {
+	config      clientConfig
+	client      *myClient
 	connections sync.WaitGroup
-	acceptDone  chan struct{}
 }
 
 type listenerSet struct {
 	listeners []*clientListener
-	errCh     chan error
 }
 
 type listenerManager struct {
@@ -190,45 +195,88 @@ func (m *listenerManager) reload() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	previousConfig := m.config
-	m.active.retire()
-	listeners, err := openListenerSet(m.ctx, cfg, m.keyLogWriter, m.errCh)
-	if err != nil {
-		restored, restoreErr := openListenerSet(m.ctx, previousConfig, m.keyLogWriter, m.errCh)
-		if restoreErr != nil {
-			m.active = nil
-			return fmt.Errorf("open new listeners: %w; restore previous listeners: %v", err, restoreErr)
+	previous := make(map[string]*clientListener, len(m.active.listeners))
+	for _, listener := range m.active.listeners {
+		previous[listener.listen] = listener
+	}
+
+	next := &listenerSet{listeners: make([]*clientListener, 0, len(cfg.Clients))}
+	newListeners := make([]*clientListener, 0, len(cfg.Clients))
+	for _, clientCfg := range cfg.Clients {
+		if listener, ok := previous[clientCfg.Listen]; ok {
+			next.listeners = append(next.listeners, listener)
+			delete(previous, clientCfg.Listen)
+			continue
 		}
-		m.active = restored
-		return fmt.Errorf("open new listeners: %w; restored previous listeners", err)
+
+		listener, openErr := newClientListener(m.ctx, clientCfg, m.keyLogWriter)
+		if openErr != nil {
+			for _, opened := range newListeners {
+				opened.closeUnstarted()
+			}
+			return openErr
+		}
+		newListeners = append(newListeners, listener)
+		next.listeners = append(next.listeners, listener)
+	}
+
+	for i, clientCfg := range cfg.Clients {
+		listener := next.listeners[i]
+		if listener.listen == clientCfg.Listen && !containsListener(newListeners, listener) {
+			listener.update(newClientGeneration(m.ctx, clientCfg, m.keyLogWriter))
+		}
+	}
+	for _, listener := range newListeners {
+		go listener.serve(m.ctx, m.errCh)
+		generation := listener.currentGeneration()
+		logrus.Infoln("[Client] socks5/http", listener.listen, "=>", generation.config.Server)
+	}
+	for _, listener := range previous {
+		listener.retire()
 	}
 
 	m.config = cfg
-	m.active = listeners
+	m.active = next
 	return nil
 }
 
 func openListenerSet(ctx context.Context, cfg *config, keyLogWriter io.Writer, errCh chan error) (*listenerSet, error) {
-	set := &listenerSet{errCh: errCh}
+	set := &listenerSet{}
 	for _, clientCfg := range cfg.Clients {
-		listener, err := net.Listen("tcp", clientCfg.Listen)
+		listener, err := newClientListener(ctx, clientCfg, keyLogWriter)
 		if err != nil {
 			set.closeUnstarted()
-			return nil, fmt.Errorf("listen on %s: %w", clientCfg.Listen, err)
+			return nil, err
 		}
-		set.listeners = append(set.listeners, &clientListener{
-			config:     clientCfg,
-			listener:   listener,
-			acceptDone: make(chan struct{}),
-		})
+		set.listeners = append(set.listeners, listener)
 	}
 
 	for _, listener := range set.listeners {
-		listener.client = newConfiguredClient(ctx, listener.config, keyLogWriter)
-		go listener.serve(ctx, set.errCh)
-		logrus.Infoln("[Client] socks5/http", listener.config.Listen, "=>", listener.config.Server)
+		go listener.serve(ctx, errCh)
+		generation := listener.currentGeneration()
+		logrus.Infoln("[Client] socks5/http", listener.listen, "=>", generation.config.Server)
 	}
 	return set, nil
+}
+
+func newClientListener(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) (*clientListener, error) {
+	listener, err := net.Listen("tcp", clientCfg.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", clientCfg.Listen, err)
+	}
+	return &clientListener{
+		listen:     clientCfg.Listen,
+		listener:   listener,
+		generation: newClientGeneration(ctx, clientCfg, keyLogWriter),
+		acceptDone: make(chan struct{}),
+	}, nil
+}
+
+func newClientGeneration(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) *clientGeneration {
+	return &clientGeneration{
+		config: clientCfg,
+		client: newConfiguredClient(ctx, clientCfg, keyLogWriter),
+	}
 }
 
 func newConfiguredClient(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) *myClient {
@@ -261,35 +309,78 @@ func (l *clientListener) serve(ctx context.Context, errCh chan<- error) {
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
 				select {
-				case errCh <- fmt.Errorf("accept on %s: %w", l.config.Listen, err):
+				case errCh <- fmt.Errorf("accept on %s: %w", l.listen, err):
 				default:
 				}
 			}
 			return
 		}
-		l.connections.Add(1)
+		generation := l.acquireGeneration()
 		go func() {
-			defer l.connections.Done()
-			handleTcpConnection(ctx, c, l.client)
+			defer generation.connections.Done()
+			handleTcpConnection(ctx, c, generation.client)
 		}()
 	}
 }
 
+func (l *clientListener) acquireGeneration() *clientGeneration {
+	l.generationMu.Lock()
+	defer l.generationMu.Unlock()
+	l.generation.connections.Add(1)
+	return l.generation
+}
+
+func (l *clientListener) currentGeneration() *clientGeneration {
+	l.generationMu.Lock()
+	defer l.generationMu.Unlock()
+	return l.generation
+}
+
+func (l *clientListener) update(generation *clientGeneration) {
+	l.generationMu.Lock()
+	previous := l.generation
+	l.generation = generation
+	l.generationMu.Unlock()
+	closeGenerationWhenIdle(previous)
+}
+
+func (l *clientListener) retire() {
+	_ = l.listener.Close()
+	go func() {
+		<-l.acceptDone
+		closeGenerationWhenIdle(l.currentGeneration())
+	}()
+}
+
+func (l *clientListener) closeUnstarted() {
+	_ = l.listener.Close()
+	_ = l.currentGeneration().client.Close()
+}
+
+func closeGenerationWhenIdle(generation *clientGeneration) {
+	go func() {
+		generation.connections.Wait()
+		_ = generation.client.Close()
+	}()
+}
+
+func containsListener(listeners []*clientListener, target *clientListener) bool {
+	for _, listener := range listeners {
+		if listener == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *listenerSet) retire() {
 	for _, listener := range s.listeners {
-		_ = listener.listener.Close()
-	}
-	for _, listener := range s.listeners {
-		go func() {
-			<-listener.acceptDone
-			listener.connections.Wait()
-			_ = listener.client.Close()
-		}()
+		listener.retire()
 	}
 }
 
 func (s *listenerSet) closeUnstarted() {
 	for _, listener := range s.listeners {
-		_ = listener.listener.Close()
+		listener.closeUnstarted()
 	}
 }

@@ -121,7 +121,7 @@ func TestReloadReplacesListeners(t *testing.T) {
 	assertDialSucceeds(t, newAddress)
 }
 
-func TestReloadReopensUnchangedListenAddress(t *testing.T) {
+func TestReloadReusesUnchangedListenAddress(t *testing.T) {
 	address := freeTCPAddress(t)
 	path := writeTestConfig(t, testClientConfig(address, "first.example:443"))
 	manager := newListenerManager(context.Background(), path, nil)
@@ -130,18 +130,64 @@ func TestReloadReopensUnchangedListenAddress(t *testing.T) {
 	}
 	t.Cleanup(func() { manager.active.retire() })
 
-	oldSet := manager.active
+	oldListener := manager.active.listeners[0]
+	oldSocket := oldListener.listener
+	oldGeneration := oldListener.currentGeneration()
 	if err := os.WriteFile(path, []byte(testClientConfig(address, "second.example:443")), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.reload(); err != nil {
 		t.Fatal(err)
 	}
-	if manager.active == oldSet {
-		t.Fatal("reload did not replace the listener set")
+	listener := manager.active.listeners[0]
+	if listener != oldListener {
+		t.Fatal("reload replaced the listener for an unchanged address")
 	}
-	if manager.config.Clients[0].Server != "second.example:443" {
-		t.Fatalf("got server %q after reload", manager.config.Clients[0].Server)
+	if listener.listener != oldSocket {
+		t.Fatal("reload replaced the socket for an unchanged address")
+	}
+	if listener.currentGeneration() == oldGeneration {
+		t.Fatal("reload did not update the reused listener's client generation")
+	}
+	if listener.currentGeneration().config.Server != "second.example:443" {
+		t.Fatalf("got server %q after reload", listener.currentGeneration().config.Server)
+	}
+	assertDialSucceeds(t, address)
+}
+
+func TestReloadBindFailureDoesNotUpdateReusedListener(t *testing.T) {
+	address := freeTCPAddress(t)
+	path := writeTestConfig(t, testClientConfig(address, "first.example:443"))
+	manager := newListenerManager(context.Background(), path, nil)
+	if err := manager.start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.active.retire() })
+
+	active := manager.active
+	listener := active.listeners[0]
+	generation := listener.currentGeneration()
+	blocked, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocked.Close() })
+
+	contents := testClientConfig(address, "second.example:443") + fmt.Sprintf("  - listen: %s\n    server: third.example:443\n    password: secret\n    min-idle: 0\n", blocked.Addr())
+	if err = os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = manager.reload(); err == nil {
+		t.Fatal("expected reload with an occupied new address to fail")
+	}
+	if manager.active != active || manager.active.listeners[0] != listener {
+		t.Fatal("failed reload replaced the active listener set")
+	}
+	if listener.currentGeneration() != generation {
+		t.Fatal("failed reload updated a reused listener's client generation")
+	}
+	if listener.currentGeneration().config.Server != "first.example:443" {
+		t.Fatalf("got server %q after failed reload", listener.currentGeneration().config.Server)
 	}
 	assertDialSucceeds(t, address)
 }
