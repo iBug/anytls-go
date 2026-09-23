@@ -94,13 +94,18 @@ func loadConfig(path string) (*config, error) {
 	if len(cfg.Clients) == 0 {
 		return nil, fmt.Errorf("clients must contain at least one item")
 	}
+	listenAddresses := make(map[string]struct{}, len(cfg.Clients))
 	for i := range cfg.Clients {
 		client := &cfg.Clients[i]
 		client.Listen = strings.TrimSpace(client.Listen)
 		client.Server = strings.TrimSpace(client.Server)
-		if _, _, err = net.SplitHostPort(client.Listen); err != nil {
-			return nil, fmt.Errorf("clients[%d].listen %q: %w", i, client.Listen, err)
+		if client.Listen == "" {
+			return nil, fmt.Errorf("clients[%d].listen must not be empty", i)
 		}
+		if _, exists := listenAddresses[client.Listen]; exists {
+			return nil, fmt.Errorf("clients[%d].listen %q is duplicated", i, client.Listen)
+		}
+		listenAddresses[client.Listen] = struct{}{}
 		if _, _, err = net.SplitHostPort(client.Server); err != nil {
 			return nil, fmt.Errorf("clients[%d].server %q: %w", i, client.Server, err)
 		}
@@ -260,7 +265,7 @@ func openListenerSet(ctx context.Context, cfg *config, keyLogWriter io.Writer, e
 }
 
 func newClientListener(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) (*clientListener, error) {
-	listener, err := net.Listen("tcp", clientCfg.Listen)
+	listener, err := listen(clientCfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", clientCfg.Listen, err)
 	}
@@ -270,6 +275,26 @@ func newClientListener(ctx context.Context, clientCfg clientConfig, keyLogWriter
 		generation: newClientGeneration(ctx, clientCfg, keyLogWriter),
 		acceptDone: make(chan struct{}),
 	}, nil
+}
+
+func listen(address string) (net.Listener, error) {
+	if _, _, err := net.SplitHostPort(address); err == nil {
+		return net.Listen("tcp", address)
+	}
+
+	info, err := os.Lstat(address)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("path exists and is not a socket")
+		}
+		if err = os.Remove(address); err != nil {
+			return nil, fmt.Errorf("unlink existing socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect Unix socket path: %w", err)
+	}
+
+	return net.Listen("unix", address)
 }
 
 func newClientGeneration(ctx context.Context, clientCfg clientConfig, keyLogWriter io.Writer) *clientGeneration {

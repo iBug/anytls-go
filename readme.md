@@ -34,7 +34,7 @@
 ./anytls-client -c /path/to/config.yml
 ```
 
-配置文件格式参见 [`examples/config.yml`](./examples/config.yml)。`clients` 列表中的每一项都会启动一个 Socks5/HTTP 代理监听器，理论上支持 TCP 和 UDP（通过 udp over tcp 传输）。
+配置文件格式参见 [`examples/config.yml`](./examples/config.yml)。`clients` 列表中的每一项都会启动一个 Socks5/HTTP 代理监听器，理论上支持 TCP 和 UDP（通过 udp over tcp 传输）。 `listen` 可以是 TCP 地址（如 `127.0.0.1:1080`），也可以是 Unix socket 文件路径；已有的 socket 文件会在监听前移除，其他同名文件不会被覆盖。
 
 修改配置文件后可向客户端进程发送 `SIGHUP` 重新加载。地址和端口不变的监听器会被复用并更新配置，其他监听器则按新配置增删；已建立的连接会尽量保持。如果新配置校验或监听失败，则保留现有监听器并输出警告。
 
