@@ -5,7 +5,8 @@ ConditionPathExists=/etc/anytls-client.yml
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/anytls-client-ibug -c /etc/anytls-client.yml
+ExecStart=/usr/bin/anytls-client -c /etc/anytls-client.yml
+ExecReload=/bin/kill -HUP $MAINPID
 WorkingDirectory=/run/anytls
 RuntimeDirectory=anytls
 Restart=on-failure
